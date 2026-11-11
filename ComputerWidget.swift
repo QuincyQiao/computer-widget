@@ -225,6 +225,38 @@ struct Snapshot: Equatable {
     }
 }
 
+extension Snapshot {
+    func displayed(for module: Module?, hogCount: Int) -> Snapshot {
+        var result = Snapshot()
+        func fraction(_ value: Double) -> Double { value > 0 && value < 0.001 ? 0.0001 : (value * 1000).rounded() / 1000 }
+        switch module {
+        case .overview, .cpu:
+            result.cpu = cpu.map(fraction); result.load = load.map { ($0 * 10).rounded() / 10 }
+            if module == .overview {
+                result.gpu = gpu.map(fraction)
+                // Tooltips show GB to one decimal place; the ring also needs the displayed percentage.
+                result.memoryUsed = memoryUsed; result.memoryTotal = memoryTotal; result.swapUsed = swapUsed
+                result.pressure = pressure
+            } else { result.byCategory = byCategory.mapValues(fraction) }
+        case .hogs:
+            result.hogs = hogs.prefix(hogCount).map { Hog(name: $0.name, category: $0.category, cpu: fraction($0.cpu), count: $0.count) }
+        case .queue, nil:
+            result.slots = slots; result.waiting = waiting; result.waitingQuick = waitingQuick
+        }
+        return result
+    }
+}
+
+struct SamplingNeeds: Equatable {
+    var overview = true
+    var processes = true
+    var queue = true
+    static func visible(_ modules: [Module], hogPopover: Bool, queuePopover: Bool) -> Self {
+        Self(overview: modules.contains(.overview), processes: modules.contains(.cpu) || modules.contains(.hogs) || hogPopover,
+             queue: RenderQueue.folder != nil || queuePopover)
+    }
+}
+
 /// 系统库里有、头文件没写的函数：这个进程是替谁开的（活动监视器也靠它把网页进程算到对应程序名下）
 @_silgen_name("responsibility_get_pid_responsible_for_pid")
 func responsibility_get_pid_responsible_for_pid(_ pid: pid_t) -> pid_t
@@ -421,9 +453,26 @@ enum RenderQueue {
     }
 }
 
-/// 看得见每 2 秒采一次，被别的窗口挡住每 15 秒，隐藏了停
+/// 看得见每 10 秒采一次，被遮挡每 60 秒，隐藏、熄屏或系统睡眠时暂停
+@MainActor final class SnapshotState: ObservableObject {
+    @Published private(set) var snapshot = Snapshot()
+    func update(_ next: Snapshot) { if next != snapshot { snapshot = next } }
+}
+
 @MainActor final class Monitor: ObservableObject {
-    @Published var snapshot = Snapshot()
+    private(set) var snapshot = Snapshot()
+    @Published private(set) var pressure: Int32 = 1
+    private let overviewState = SnapshotState(), cpuState = SnapshotState(), queueState = SnapshotState(), hogState = SnapshotState()
+    func section(_ module: Module?) -> SnapshotState {
+        switch module { case .overview: overviewState; case .cpu: cpuState; case .hogs: hogState; case .queue, nil: queueState }
+    }
+    private func publish(_ next: Snapshot) {
+        snapshot = next
+        if pressure != next.pressure { pressure = next.pressure }
+        for module in [Module.overview, .cpu, .queue, .hogs] {
+            section(module).update(next.displayed(for: module, hogCount: 20))
+        }
+    }
     @Published var pinned = false
     /// 鼠标在小组件上：右下角的拉伸手柄显深一点（命令行工具链没有 @State 的宏，放在这里）
     @Published var hovering = false
@@ -435,69 +484,82 @@ enum RenderQueue {
     private let me = ProcessInfo.processInfo.processIdentifier
     private let queue = DispatchQueue(label: "computer-activity.sample", qos: .utility)
     private var sampling = false
+    private var needs = SamplingNeeds()
+    private var generation = 0
 
     init(preview: Snapshot? = nil) {
-        if let preview { snapshot = preview }
+        if let preview { publish(preview) }
     }
 
     enum Pace { case off, slow, live }
     private var pace = Pace.off
 
-    func setPace(_ next: Pace) {
-        guard next != pace else { return }
+    func setPace(_ next: Pace, needs nextNeeds: SamplingNeeds = SamplingNeeds()) {
+        let changed = nextNeeds != needs
+        needs = nextNeeds
+        guard next != pace || changed else { return }
         pace = next
+        generation += 1
         timer?.invalidate(); timer = nil
         guard next != .off else {
             lastTicks = nil; lastProcesses = [:]               // 隔了很久再看，不拿旧数算平均
             return
         }
         sample()
-        timer = Timer.scheduledTimer(withTimeInterval: next == .live ? 2 : 15, repeats: true) { [weak self] _ in
+        let interval: TimeInterval = next == .live ? 10 : 60
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.sample() }
         }
+        timer?.tolerance = interval * 0.2
     }
 
     private func sample() {
         guard !sampling else { return }
         sampling = true
+        let samplingGeneration = generation
+        let requested = needs
         let previous = (lastTicks, lastProcesses, lastTime, paths, me)
         queue.async { [weak self] in
             let result = Monitor.measure(previousTicks: previous.0, previousProcesses: previous.1, since: previous.2,
-                                         paths: previous.3, me: previous.4)
+                                         paths: previous.3, me: previous.4, needs: requested)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { return }
+                    self.sampling = false
+                    guard self.pace != .off else { return }
+                    guard self.generation == samplingGeneration else { self.sample(); return }
                     self.lastTicks = result.ticks; self.lastProcesses = result.processes
                     self.lastTime = result.time; self.paths = result.paths
                     var snapshot = result.snapshot
                     if snapshot.cpu == nil {                   // 刚开始采、还没有两次可比：CPU 先沿用上次的
                         snapshot.cpu = self.snapshot.cpu; snapshot.byCategory = self.snapshot.byCategory; snapshot.hogs = self.snapshot.hogs
                     }
-                    self.snapshot = snapshot
-                    self.sampling = false
+                    self.publish(snapshot)
                 }
             }
         }
     }
 
     nonisolated static func measure(previousTicks: (busy: UInt64, total: UInt64)?, previousProcesses: [Int32: (name: String, seconds: Double)],
-                                    since: Date, paths oldPaths: [Int32: String?], me: Int32)
+                                    since: Date, paths oldPaths: [Int32: String?], me: Int32, needs: SamplingNeeds = SamplingNeeds())
         -> (snapshot: Snapshot, ticks: (busy: UInt64, total: UInt64)?, processes: [Int32: (name: String, seconds: Double)], time: Date, paths: [Int32: String?]) {
         let now = Date()
         let ticks = Probe.cpuTicks()
-        let processes = Probe.processes()
+        let processes = needs.processes ? Probe.processes() : [:]
         var paths = oldPaths.filter { processes[$0.key] != nil }
         let memory = Probe.memory()
         var snap = Snapshot()
         snap.memoryUsed = memory.used; snap.memoryTotal = memory.total; snap.swapUsed = memory.swap; snap.pressure = memory.pressure
-        snap.gpu = Probe.gpu()
+        snap.gpu = needs.overview ? Probe.gpu() : nil
         snap.load = Probe.load()
-        let queue = RenderQueue.read(pressure: memory.pressure, now: now)
+        let queue = needs.queue ? RenderQueue.read(pressure: memory.pressure, now: now) : (slots: [Slot](), waiting: [QueueItem](), quick: [QueueItem]())
         snap.slots = queue.slots; snap.waiting = queue.waiting; snap.waitingQuick = queue.quick
-        guard let ticks, let previousTicks, ticks.total > previousTicks.total, !previousProcesses.isEmpty else {
+        guard let ticks, let previousTicks, ticks.total > previousTicks.total else {
             return (snap, ticks, processes, now, paths)               // 内存、GPU、排队先有；CPU 等下一次
         }
         let total = Double(ticks.busy - previousTicks.busy) / Double(ticks.total - previousTicks.total)
+        snap.cpu = min(max(total, 0), 1)
+        guard needs.processes, !previousProcesses.isEmpty else { return (snap, ticks, processes, now, paths) }
         let wall = max(now.timeIntervalSince(since), 0.5)
         var byCategory: [Category: Double] = [:]
         var programs: [String: Hog] = [:]
@@ -624,6 +686,46 @@ struct WidgetActions {
     var showSettings: () -> Void = {}
 }
 
+/// 数值仍按原精度采集；只把屏幕上不足一个像素的分类条变化合并。
+enum CategoryBarLayout {
+    struct Part: Identifiable {
+        let category: Category
+        let start: Double
+        let width: Double
+        var id: Category { category }
+    }
+
+    static func parts(_ shares: [Category: Double], width: Double) -> [Part] {
+        let values = Category.allCases.map { ($0, ((shares[$0] ?? 0) * 1000).rounded() / 1000) }
+        let shown = values.filter { $0.1 >= 0.004 }
+        let available = max(0, width - Double(max(0, shown.count - 1)) * 2)
+        let total = max(1, shown.reduce(0) { $0 + $1.1 })
+        var x = 0.0
+        return values.map { category, share in
+            let segment = share >= 0.004 ? min(max(0, width - x), max(3, available * share / total)) : 0
+            let part = Part(category: category, start: x, width: segment)
+            if segment > 0 { x += segment + 2 }
+            return part
+        }
+    }
+}
+
+/// 只插值图形路径，不在每一帧动画中重新布局整个分类卡片。
+struct CategoryBarSegment: Shape {
+    var start: Double
+    var width: Double
+
+    var animatableData: AnimatablePair<Double, Double> {
+        get { AnimatablePair(start, width) }
+        set { start = newValue.first; width = newValue.second }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        guard width > 0 else { return Path() }
+        return Path(roundedRect: CGRect(x: start, y: 0, width: width, height: rect.height), cornerRadius: 3)
+    }
+}
+
 /// 圆环读数：GPU 是中性色，内存按压力着色
 struct Gauge: View {
     let value: Double?
@@ -633,7 +735,7 @@ struct Gauge: View {
     var labelColor: Color?
 
     var body: some View {
-        let fraction = max(min(value ?? 0, 1), 0.005)
+        let fraction = max(min(((value ?? 0) * 100).rounded() / 100, 1), 0.005)
         ZStack {
             Circle().stroke(ink.opacity(0.07), lineWidth: 7)
             Circle().trim(from: 0, to: fraction)
@@ -641,7 +743,7 @@ struct Gauge: View {
                                         startAngle: .degrees(0), endAngle: .degrees(360 * fraction)),
                         style: StrokeStyle(lineWidth: 7, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-                .animation(.smooth(duration: 0.8), value: fraction)
+                .animation(.easeOut(duration: 0.25), value: fraction)
             VStack(spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 1) {
                     Text(value.map { String(format: "%.0f", $0 * 100) } ?? "—")
@@ -693,7 +795,7 @@ struct ActivityView: View {
     private var ink: Color { p.ink }
     private var hovering: Bool { monitor.hovering }
     /// 平时是渲染的蓝；内存偏紧、紧张时跟着变
-    private var accent: Color { s.pressure >= 2 ? p.pressure(s.pressure) : p.blue }
+    private var accent: Color { monitor.pressure >= 2 ? p.pressure(monitor.pressure) : p.blue }
 
     var body: some View {
         GeometryReader { geo in
@@ -724,11 +826,17 @@ struct ActivityView: View {
     private func content(count: Int) -> some View {
         let visible = Array(settings.shown.prefix(count))
         return VStack(alignment: .leading, spacing: WidgetLayout.gap) {
-            header(showQueue: RenderQueue.folder != nil && !visible.contains(.queue))
-            ForEach(visible, id: \.self) { module in card(module, visible: visible) }
+            section(nil, visible: visible)
+            ForEach(visible, id: \.self) { module in section(module, visible: visible) }
         }
         .padding(WidgetLayout.pad)
         .animation(.smooth(duration: 0.35), value: settings.shown)
+    }
+
+    private func section(_ module: Module?, visible: [Module]) -> some View {
+        ObservedActivitySection(state: monitor.section(module), module: module, p: p,
+                                settings: settings, visible: visible, pinned: monitor.pinned,
+                                hogCount: settings.hogCount, actions: actions)
     }
 
     private func background(zoom: CGFloat) -> some View {
@@ -742,7 +850,7 @@ struct ActivityView: View {
             RadialGradient(colors: [accent.opacity(p.dark ? 0.18 : 0.12), .clear],
                            center: .topTrailing, startRadius: 0, endRadius: 340 * zoom)
         }
-        .animation(.smooth(duration: 0.6), value: s.pressure)
+        .animation(.smooth(duration: 0.6), value: monitor.pressure)
     }
 
     private func grip(zoom: CGFloat) -> some View {
@@ -762,6 +870,43 @@ struct ActivityView: View {
         .help("拖动调整大小")
     }
 
+}
+
+struct ObservedActivitySection: View {
+    @ObservedObject var state: SnapshotState
+    let module: Module?
+    let p: Palette
+    let settings: Settings
+    let visible: [Module]
+    let pinned: Bool
+    let hogCount: Int
+    let actions: WidgetActions
+    var body: some View {
+        ActivitySection(module: module, s: state.snapshot.displayed(for: module, hogCount: hogCount), p: p,
+                        settings: settings, visible: visible, pinned: pinned,
+                        hogCount: hogCount, actions: actions).equatable()
+    }
+}
+
+/// 每块只接收自己的显示数据；CPU 变化不会重算排队卡或未变化的模块。
+struct ActivitySection: View, Equatable {
+    let module: Module?
+    let s: Snapshot
+    let p: Palette
+    let settings: Settings
+    let visible: [Module]
+    let pinned: Bool
+    let hogCount: Int
+    let actions: WidgetActions
+    private var ink: Color { p.ink }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.module == rhs.module && lhs.s == rhs.s && lhs.p.dark == rhs.p.dark
+        && lhs.visible == rhs.visible && lhs.pinned == rhs.pinned && lhs.hogCount == rhs.hogCount
+    }
+    var body: some View {
+        if let module { card(module, visible: visible) }
+        else { header(showQueue: RenderQueue.folder != nil && !visible.contains(.queue)) }
+    }
     // 顶上一条：排队状态（点开看全部；渲染排队那块显示着就不重复），自定义、置顶、菜单
     private func header(showQueue: Bool) -> some View {
         HStack(spacing: 4) {
@@ -782,8 +927,8 @@ struct ActivityView: View {
             }
             Spacer(minLength: 6)
             iconButton("slider.horizontal.3", action: actions.showSettings, help: "自定义：显示哪几块、先后")
-            iconButton(monitor.pinned ? "pin.fill" : "pin", action: actions.togglePin,
-                       help: monitor.pinned ? "已置顶，点击改为桌面显示" : "桌面显示，点击始终置顶", strong: monitor.pinned)
+            iconButton(pinned ? "pin.fill" : "pin", action: actions.togglePin,
+                       help: pinned ? "已置顶，点击改为桌面显示" : "桌面显示，点击始终置顶", strong: pinned)
             iconButton("ellipsis", action: actions.showMenu, help: "更多")
         }
         .frame(height: WidgetLayout.header)
@@ -851,7 +996,7 @@ struct ActivityView: View {
                     Text(s.cpu.map { String(format: "%.0f", $0 * 100) } ?? "—")
                         .font(.system(size: 54, weight: .light, design: .rounded)).monospacedDigit()
                         .contentTransition(.opacity)
-                        .animation(.easeOut(duration: 0.25), value: s.cpu.map { Int($0 * 100) })
+                        .animation(.easeOut(duration: 0.25), value: s.cpu.map { Int(($0 * 100).rounded()) })
                     Text("%").font(.system(size: 18, weight: .light)).foregroundStyle(ink.opacity(0.55))
                 }
             }
@@ -911,36 +1056,43 @@ struct ActivityView: View {
                 }
             }
             categoryBar.padding(.top, 12)
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 16, alignment: .leading), GridItem(.flexible(), spacing: 16, alignment: .leading)],
-                      alignment: .leading, spacing: 8) {
-                ForEach(Category.allCases, id: \.self) { category in
-                    HStack(spacing: 6) {
-                        RoundedRectangle(cornerRadius: 2, style: .continuous).fill(p.color(category)).frame(width: 7, height: 7)
-                        Text(category.name).font(.system(size: 11, weight: .medium)).foregroundStyle(ink.opacity(0.62))
-                        Spacer(minLength: 4)
-                        Text(percent(s.cpu == nil ? nil : s.byCategory[category] ?? 0))
-                            .font(.system(size: 13, weight: .medium, design: .rounded)).monospacedDigit()
+            VStack(spacing: 8) {
+                ForEach(0..<3) { row in
+                    HStack(spacing: 16) {
+                        categoryLegend(Category.allCases[row * 2])
+                        categoryLegend(Category.allCases[row * 2 + 1])
                     }
-                    .frame(height: 17)
                 }
             }
             .padding(.top, 14)
         }
     }
 
+    private func categoryLegend(_ category: Category) -> some View {
+        HStack(spacing: 6) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous).fill(p.color(category)).frame(width: 7, height: 7)
+            Text(category.name).font(.system(size: 11, weight: .medium)).foregroundStyle(ink.opacity(0.62))
+            Spacer(minLength: 4)
+            Text(percent(s.cpu == nil ? nil : s.byCategory[category] ?? 0))
+                .font(.system(size: 13, weight: .medium, design: .rounded)).monospacedDigit()
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 17)
+    }
+
     private var categoryBar: some View {
         GeometryReader { geo in
-            let shares = Category.allCases.map { ($0, s.byCategory[$0] ?? 0) }.filter { $0.1 >= 0.004 }
-            HStack(spacing: 2) {
-                ForEach(shares, id: \.0) { category, share in
-                    RoundedRectangle(cornerRadius: 3, style: .continuous).fill(p.color(category))
-                        .frame(width: max(3, (geo.size.width - CGFloat(shares.count) * 2) * share))
+            let parts = CategoryBarLayout.parts(s.byCategory, width: geo.size.width)
+            ZStack(alignment: .leading) {
+                ForEach(parts) { part in
+                    CategoryBarSegment(start: part.start, width: part.width).fill(p.color(part.category))
+                        .animation(.easeOut(duration: 0.25), value: part.start)
+                        .animation(.easeOut(duration: 0.25), value: part.width)
                 }
-                Spacer(minLength: 0)
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .leading)
             .background(p.track, in: RoundedRectangle(cornerRadius: 3, style: .continuous))
-            .animation(.smooth(duration: 0.6), value: s.byCategory)
+            .clipped()
         }
         .frame(height: 10)
     }
@@ -1100,12 +1252,13 @@ struct PopoverShell<Content: View>: View {
 
 /// 点排队弹出来的全部清单：在跑的、普通队、快道，先来的在前
 struct QueueListView: View {
-    @ObservedObject var monitor: Monitor
+    @ObservedObject var state: SnapshotState
+    init(monitor: Monitor, scrolls: Bool = true) { state = monitor.section(.queue); self.scrolls = scrolls }
     /// 离屏预览画不出滚动区里的东西，预览时不滚
     var scrolls = true
     @Environment(\.colorScheme) var scheme
     private var p: Palette { Palette(scheme: scheme) }
-    private var s: Snapshot { monitor.snapshot }
+    private var s: Snapshot { state.snapshot }
     private var running: [Slot] { s.slots.filter { $0.job != nil } }
 
     /// 清单本身多高：按行数算好，超过 640 就滚动（滚动区自己没有理想高度，弹窗会被压扁）
@@ -1165,11 +1318,12 @@ struct QueueListView: View {
 
 /// 最占 CPU 的全部（前 20 个）
 struct HogListView: View {
-    @ObservedObject var monitor: Monitor
+    @ObservedObject var state: SnapshotState
+    init(monitor: Monitor, scrolls: Bool = true) { state = monitor.section(.hogs); self.scrolls = scrolls }
     var scrolls = true
     @Environment(\.colorScheme) var scheme
     private var p: Palette { Palette(scheme: scheme) }
-    private var hogs: [Hog] { monitor.snapshot.hogs }
+    private var hogs: [Hog] { state.snapshot.hogs }
 
     var body: some View {
         PopoverShell(title: "最占 CPU", symbol: Module.hogs.symbol, trailing: "前 \(hogs.count) 个 · 按整台电脑算", p: p) {
@@ -1271,7 +1425,7 @@ final class WidgetPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSPopoverDelegate {
     var monitor: Monitor!
     var settings: Settings { Settings.shared }
     var panel: WidgetPanel!
@@ -1279,9 +1433,13 @@ final class WidgetPanel: NSPanel {
     var menu: NSMenu!
     var pinItem: NSMenuItem!
     var loginItem: NSMenuItem!
-    let queuePopover = NSPopover(), hogPopover = NSPopover(), settingsPopover = NSPopover()
+    enum PopoverKind { case queue, hogs, settings }
+    var popovers: [PopoverKind: NSPopover] = [:]
+    func shown(_ kind: PopoverKind) -> Bool { popovers[kind]?.isShown == true }
     /// 现在显示前几块（拖高矮、改设置时跟着变）
     var visibleCount = 0
+    private var systemSleeping = false
+    private var screenSleeping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let other = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.computer.activity.widget")
@@ -1303,15 +1461,12 @@ final class WidgetPanel: NSPanel {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.delegate = self
         let actions = WidgetActions(togglePin: { [weak self] in self?.togglePin() }, showMenu: { [weak self] in self?.showMenu() },
-                                    showQueue: { [weak self] in self?.toggle(self?.queuePopover) },
-                                    showHogs: { [weak self] in self?.toggle(self?.hogPopover) },
-                                    showSettings: { [weak self] in self?.toggle(self?.settingsPopover) })
+                                    showQueue: { [weak self] in self?.toggle(.queue) },
+                                    showHogs: { [weak self] in self?.toggle(.hogs) },
+                                    showSettings: { [weak self] in self?.toggle(.settings) })
         host = NSHostingView(rootView: ActivityView(monitor: monitor, settings: settings, actions: actions))
         host.sizingOptions = []
         panel.contentView = host
-        setUp(queuePopover, QueueListView(monitor: monitor))
-        setUp(hogPopover, HogListView(monitor: monitor))
-        setUp(settingsPopover, ModuleSettingsView(settings: settings))
         settings.onChange = { [weak self] modulesChanged in self?.relayout(showAll: modulesChanged) }
         createMenu()
         restoreFrame()
@@ -1319,14 +1474,35 @@ final class WidgetPanel: NSPanel {
         NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: panel, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateSampling() }
         }
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
+                     NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    switch note.name {
+                    case NSWorkspace.willSleepNotification: self.systemSleeping = true
+                    case NSWorkspace.didWakeNotification: self.systemSleeping = false
+                    case NSWorkspace.screensDidSleepNotification: self.screenSleeping = true
+                    case NSWorkspace.screensDidWakeNotification: self.screenSleeping = false
+                    default: break
+                    }
+                    self.updateSampling()
+                }
+            }
+        }
+        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: NSApp, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateSampling() }
+            }
+        }
         // 本机别的程序（快捷指令、测试脚本）发这个通知就弹出对应的清单：object 是 queue、hogs 或 settings
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("local.computer.activity.widget.show"),
                                                             object: nil, queue: .main) { [weak self] note in
             let which = note.object as? String
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let target = which == "hogs" ? self.hogPopover : which == "settings" ? self.settingsPopover : self.queuePopover
-                if !target.isShown { self.toggle(target) }
+                let target: PopoverKind = which == "hogs" ? .hogs : which == "settings" ? .settings : .queue
+                if !self.shown(target) { self.toggle(target) }
             }
         }
         panel.orderFrontRegardless()
@@ -1334,6 +1510,7 @@ final class WidgetPanel: NSPanel {
     }
 
     func setUp(_ popover: NSPopover, _ view: some View) {
+        popover.delegate = self
         popover.behavior = .transient
         popover.animates = true
         let controller = NSHostingController(rootView: AnyView(view))
@@ -1342,18 +1519,35 @@ final class WidgetPanel: NSPanel {
     }
 
     /// 弹窗弹在小组件旁边，点别处收起；同时只开一个
-    func toggle(_ popover: NSPopover?) {
-        guard let popover else { return }
-        if popover.isShown { popover.performClose(nil); return }
-        for other in [queuePopover, hogPopover, settingsPopover] where other !== popover && other.isShown { other.performClose(nil) }
+    func toggle(_ kind: PopoverKind) {
+        if let existing = popovers[kind], existing.isShown { existing.performClose(nil); return }
+        for existing in Array(popovers.values) where existing.isShown { existing.performClose(nil) }
+        let popover = NSPopover()
+        switch kind {
+        case .queue: setUp(popover, QueueListView(monitor: monitor))
+        case .hogs: setUp(popover, HogListView(monitor: monitor))
+        case .settings: setUp(popover, ModuleSettingsView(settings: settings))
+        }
+        popovers[kind] = popover
         NSApp.activate()
         popover.show(relativeTo: host.bounds, of: host, preferredEdge: .minX)
         updateSampling()
     }
 
+    func popoverDidClose(_ notification: Notification) {
+        guard let closed = notification.object as? NSPopover,
+              let kind = popovers.first(where: { $0.value === closed })?.key else { return }
+        popovers.removeValue(forKey: kind)
+        closed.contentViewController = nil
+        updateSampling()
+    }
+
     func updateSampling() {
-        let visible = panel.occlusionState.contains(.visible) || queuePopover.isShown || hogPopover.isShown
-        monitor.setPace(!panel.isVisible ? .off : visible ? .live : .slow)
+        guard monitor != nil, host != nil, panel != nil else { return }
+        let visible = panel.occlusionState.contains(.visible) || shown(.queue) || shown(.hogs)
+        let modules = Array(settings.shown.prefix(visibleCount))
+        let needs = SamplingNeeds.visible(modules, hogPopover: shown(.hogs), queuePopover: shown(.queue))
+        monitor.setPace(!panel.isVisible ? .off : visible ? .live : .slow, needs: needs)
     }
 
     func restoreFrame() {
@@ -1381,6 +1575,7 @@ final class WidgetPanel: NSPanel {
         updateLimits()
         panel.setFrame(onScreen(NSRect(x: frame.minX, y: frame.maxY - height, width: frame.width, height: height)), display: true, animate: true)
         visibleCount = count
+        updateSampling()
     }
 
     func updateLimits() {
@@ -1435,7 +1630,7 @@ final class WidgetPanel: NSPanel {
                      "GPU：显卡占用，渲染画面主要用它",
                      "内存圆环：绿够用、黄偏紧（新渲染只开 2 个位子）、红紧张；鼠标停在上面看借了多少硬盘当内存",
                      "系统：WindowServer、内核这类读不到明细的系统进程；云同步：iCloud 这类云盘",
-                     "看得见时每 2 秒刷新，被别的窗口挡住时每 15 秒"] {
+                     "看得见时每 10 秒刷新，被遮挡时每 60 秒；隐藏或熄屏时暂停"] {
             menu.addItem(withTitle: note, action: nil, keyEquivalent: "")
         }
         menu.addItem(.separator())
@@ -1452,9 +1647,9 @@ final class WidgetPanel: NSPanel {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
-    @objc func openSettings() { panel.orderFrontRegardless(); if !settingsPopover.isShown { toggle(settingsPopover) } }
-    @objc func openQueue() { panel.orderFrontRegardless(); if !queuePopover.isShown { toggle(queuePopover) } }
-    @objc func openHogs() { panel.orderFrontRegardless(); if !hogPopover.isShown { toggle(hogPopover) } }
+    @objc func openSettings() { panel.orderFrontRegardless(); if !shown(.settings) { toggle(.settings) } }
+    @objc func openQueue() { panel.orderFrontRegardless(); if !shown(.queue) { toggle(.queue) } }
+    @objc func openHogs() { panel.orderFrontRegardless(); if !shown(.hogs) { toggle(.hogs) } }
     @objc func showWidget() { panel.orderFrontRegardless(); updateSampling() }
     @objc func togglePin() {
         monitor.pinned.toggle()
@@ -1486,6 +1681,7 @@ final class WidgetPanel: NSPanel {
     func windowDidResize(_ notification: Notification) {
         panel.invalidateShadow(); saveFrame()
         visibleCount = WidgetLayout.count(for: panel.frame.height * WidgetLayout.width / panel.frame.width)
+        updateSampling()
     }
     func windowDidMove(_ notification: Notification) { saveFrame() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showWidget(); return true }
@@ -1600,6 +1796,15 @@ func makeIcon(at path: String) {
 }
 
 @MainActor func selfTest() {
+    // 分类条：零值、过载和很窄的窗口都不越界；低于屏幕精度的抖动保持相同几何。
+    for width in [0.0, 1, 20, 300] {
+        let parts = CategoryBarLayout.parts([.render: 0.9, .browser: 0.8, .system: 0.2], width: width)
+        precondition(parts.allSatisfy { $0.start >= 0 && $0.width >= 0 && ($0.width == 0 || $0.start + $0.width <= width + 0.0001) })
+    }
+    precondition(CategoryBarLayout.parts([:], width: 300).allSatisfy { $0.width == 0 })
+    let barA = CategoryBarLayout.parts([.render: 0.1001], width: 300)
+    let barB = CategoryBarLayout.parts([.render: 0.1002], width: 300)
+    precondition(zip(barA, barB).allSatisfy { $0.start == $1.start && $0.width == $1.width })
     precondition(Classifier.program("Google Chrome Helper (Renderer)") == "Google Chrome")
     precondition(Classifier.program("Claude Helper (Renderer)") == "Claude")
     precondition(Classifier.program("python3.12") == "Python")
@@ -1677,6 +1882,20 @@ func makeIcon(at path: String) {
     precondition(!RenderQueue.read(pressure: 2).slots[2].open)
     close(a); close(b); close(c)
     precondition(RenderQueue.read(pressure: 1).waiting.isEmpty)
+    precondition(!SamplingNeeds.visible([.overview], hogPopover: false, queuePopover: false).processes)
+    precondition(SamplingNeeds.visible([.overview], hogPopover: true, queuePopover: false).processes)
+    precondition(SamplingNeeds.visible([.cpu], hogPopover: false, queuePopover: false).processes)
+    let scoped = Monitor.measure(previousTicks: nil, previousProcesses: [:], since: Date(), paths: [:], me: 0,
+                                 needs: SamplingNeeds(overview: false, processes: false, queue: false))
+    precondition(scoped.processes.isEmpty && scoped.paths.isEmpty && scoped.snapshot.gpu == nil && scoped.snapshot.slots.isEmpty)
+    let second = Monitor.measure(previousTicks: scoped.ticks, previousProcesses: [:], since: scoped.time, paths: [:], me: 0,
+                                 needs: SamplingNeeds(overview: true, processes: false, queue: false))
+    precondition(second.processes.isEmpty)
+    if let a = scoped.ticks, let b = second.ticks, b.total > a.total { precondition(second.snapshot.cpu != nil) }
+    var one = Snapshot(); one.cpu = 0.1
+    var two = one; two.cpu = 0.9
+    precondition(one.displayed(for: .queue, hogCount: 3) == two.displayed(for: .queue, hogCount: 3))
+    precondition(one.displayed(for: .overview, hogCount: 3) != two.displayed(for: .overview, hogCount: 3))
     print("自测通过")
 }
 

@@ -28,6 +28,13 @@ done
 /usr/bin/plutil -lint "$staged_app/Contents/Info.plist"
 /usr/bin/codesign --force --sign - --timestamp=none "$staged_app"
 /usr/bin/codesign --verify --strict "$staged_app"
+
+# 自动同步只打包和自测；安装器另外处理运行状态、回退及本机设置。
+if [[ -n "${SOFTWARE_SYNC_STAGE_ONLY:-}" ]]; then
+    /usr/bin/ditto --norsrc --noextattr "$staged_app" "$build_dir/ComputerWidget.app"
+    print -r -- "已打包：$build_dir/ComputerWidget.app"
+    exit 0
+fi
 if [[ -n "${COMPUTER_STAGE_ONLY:-}" ]]; then
     print -r -- "编译和自测通过，没有替换正在运行的小组件"
     exit 0
